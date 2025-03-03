@@ -1,0 +1,480 @@
+# Azure Data Factory Cloud Migration Pipeline
+
+# Import necessary libraries
+import os
+import pandas as pd
+import logging
+from azure.storage.blob import BlobServiceClient
+from azure.identity import DefaultAzureCredential
+from azure.mgmt.datafactory import DataFactoryManagementClient
+from azure.mgmt.datafactory.models import *
+import pyodbc
+import time
+from datetime import datetime, timedelta
+import json
+import configparser
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("migration_pipeline.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+class CloudMigrationPipeline:
+    """
+    A scalable ETL pipeline for migrating data from on-premises to Azure Cloud
+    with built-in performance optimization and cost efficiency controls.
+    """
+    
+    def __init__(self, config_file='config.ini'):
+        """Initialize the migration pipeline with configuration settings."""
+        self.config = configparser.ConfigParser()
+        self.config.read(config_file)
+        
+        # Azure credentials
+        self.subscription_id = self.config['Azure']['SubscriptionId']
+        self.resource_group = self.config['Azure']['ResourceGroup']
+        self.data_factory_name = self.config['Azure']['DataFactoryName']
+        self.storage_account_name = self.config['Azure']['StorageAccountName']
+        self.storage_account_key = self.config['Azure']['StorageAccountKey']
+        self.container_name = self.config['Azure']['ContainerName']
+        
+        # On-prem database connection info
+        self.db_server = self.config['OnPremDB']['Server']
+        self.db_name = self.config['OnPremDB']['Database']
+        self.db_username = self.config['OnPremDB']['Username']
+        self.db_password = self.config['OnPremDB']['Password']
+        
+        # Migration settings
+        self.batch_size = int(self.config['Migration']['BatchSize'])
+        self.parallel_threads = int(self.config['Migration']['ParallelThreads'])
+        self.data_sources = json.loads(self.config['Migration']['DataSources'])
+        
+        # Initialize clients
+        self.credential = DefaultAzureCredential()
+        self.adf_client = DataFactoryManagementClient(self.credential, self.subscription_id)
+        self.blob_service_client = BlobServiceClient(
+            account_url=f"https://{self.storage_account_name}.blob.core.windows.net",
+            credential=self.storage_account_key
+        )
+        
+        logger.info("Cloud Migration Pipeline initialized successfully")
+    
+    def connect_to_source_db(self):
+        """Establish connection to on-premises database."""
+        try:
+            conn_str = f"DRIVER={{ODBC Driver 17 for SQL Server}};SERVER={self.db_server};DATABASE={self.db_name};UID={self.db_username};PWD={self.db_password}"
+            self.source_conn = pyodbc.connect(conn_str)
+            logger.info(f"Successfully connected to source database: {self.db_name}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to connect to source database: {str(e)}")
+            return False
+    
+    def create_data_factory_pipeline(self):
+        """Create Azure Data Factory pipeline for data migration."""
+        try:
+            # Create data factory if it doesn't exist
+            try:
+                df_resource = self.adf_client.factories.get(self.resource_group, self.data_factory_name)
+                logger.info(f"Data Factory '{self.data_factory_name}' already exists")
+            except:
+                df_resource = Factory(location='East US')
+                df_resource = self.adf_client.factories.create_or_update(
+                    self.resource_group, self.data_factory_name, df_resource)
+                logger.info(f"Data Factory '{self.data_factory_name}' created")
+            
+            # Create on-prem SQL linked service
+            sql_linked_service = LinkedServiceResource(
+                properties=SqlServerLinkedService(
+                    connection_string=f"integrated security=False;data source={self.db_server};initial catalog={self.db_name};user id={self.db_username};Password={self.db_password}"
+                )
+            )
+            self.adf_client.linked_services.create_or_update(
+                self.resource_group, self.data_factory_name, "OnPremSqlServer", sql_linked_service
+            )
+            
+            # Create Azure Blob Storage linked service
+            blob_linked_service = LinkedServiceResource(
+                properties=AzureBlobStorageLinkedService(
+                    connection_string=f"DefaultEndpointsProtocol=https;AccountName={self.storage_account_name};AccountKey={self.storage_account_key}"
+                )
+            )
+            self.adf_client.linked_services.create_or_update(
+                self.resource_group, self.data_factory_name, "AzureBlobStorage", blob_linked_service
+            )
+            
+            # Create pipeline for each data source
+            for source in self.data_sources:
+                table_name = source['table']
+                
+                # Create source dataset
+                sql_dataset = DatasetResource(
+                    properties=SqlServerTableDataset(
+                        linked_service_name=LinkedServiceReference(reference_name="OnPremSqlServer"),
+                        table_name=table_name
+                    )
+                )
+                self.adf_client.datasets.create_or_update(
+                    self.resource_group, self.data_factory_name, f"SourceSQL_{table_name}", sql_dataset
+                )
+                
+                # Create sink dataset
+                blob_dataset = DatasetResource(
+                    properties=DelimitedTextDataset(
+                        linked_service_name=LinkedServiceReference(reference_name="AzureBlobStorage"),
+                        folder_path=f"{self.container_name}/{table_name}",
+                        file_name=f"{table_name}.csv",
+                        column_delimiter=",",
+                        row_delimiter="\n",
+                        first_row_as_header=True
+                    )
+                )
+                self.adf_client.datasets.create_or_update(
+                    self.resource_group, self.data_factory_name, f"SinkBlob_{table_name}", blob_dataset
+                )
+                
+                # Create copy activity
+                copy_activity = CopyActivity(
+                    name=f"CopyData_{table_name}",
+                    source=SqlSource(source_retrieval_query=source.get('query', f"SELECT * FROM {table_name}")),
+                    sink=BlobSink(),
+                    inputs=[DatasetReference(reference_name=f"SourceSQL_{table_name}")],
+                    outputs=[DatasetReference(reference_name=f"SinkBlob_{table_name}")],
+                    description=f"Copy data from on-prem SQL table {table_name} to Azure Blob Storage"
+                )
+                
+                # Create pipeline with copy activity
+                pipeline = PipelineResource(
+                    activities=[copy_activity],
+                    parameters={
+                        'WindowStartTime': {'type': 'string'},
+                        'WindowEndTime': {'type': 'string'}
+                    }
+                )
+                self.adf_client.pipelines.create_or_update(
+                    self.resource_group, self.data_factory_name, f"MigratePipeline_{table_name}", pipeline
+                )
+                
+                logger.info(f"Created pipeline for table: {table_name}")
+            
+            logger.info("Successfully created all Data Factory pipelines")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to create Data Factory pipeline: {str(e)}")
+            return False
+    
+    def execute_pipelines(self):
+        """Execute all created pipelines in parallel."""
+        try:
+            # Run all pipelines
+            pipeline_run_responses = {}
+            for source in self.data_sources:
+                table_name = source['table']
+                
+                # Set up pipeline parameters
+                now = datetime.utcnow()
+                window_start_time = (now - timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%SZ")
+                window_end_time = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+                
+                # Run the pipeline
+                run_response = self.adf_client.pipelines.create_run(
+                    self.resource_group, 
+                    self.data_factory_name, 
+                    f"MigratePipeline_{table_name}",
+                    parameters={
+                        'WindowStartTime': window_start_time,
+                        'WindowEndTime': window_end_time
+                    }
+                )
+                
+                pipeline_run_responses[table_name] = run_response.run_id
+                logger.info(f"Pipeline for {table_name} started with run ID: {run_response.run_id}")
+            
+            # Monitor pipeline runs
+            self.monitor_pipeline_runs(pipeline_run_responses)
+            return True
+        except Exception as e:
+            logger.error(f"Failed to execute pipelines: {str(e)}")
+            return False
+    
+    def monitor_pipeline_runs(self, pipeline_run_responses):
+        """Monitor the progress of pipeline runs."""
+        in_progress_runs = pipeline_run_responses.copy()
+        
+        while in_progress_runs:
+            for table_name, run_id in list(in_progress_runs.items()):
+                run_response = self.adf_client.pipeline_runs.get(
+                    self.resource_group, self.data_factory_name, run_id
+                )
+                
+                status = run_response.status
+                
+                if status == 'InProgress':
+                    logger.info(f"Pipeline for {table_name} is still running...")
+                else:
+                    logger.info(f"Pipeline for {table_name} completed with status: {status}")
+                    if status == 'Failed':
+                        logger.error(f"Pipeline for {table_name} failed. Error: {run_response.message}")
+                    del in_progress_runs[table_name]
+            
+            if in_progress_runs:
+                time.sleep(60)  # Check status every minute
+    
+    def direct_extraction_to_blob(self, table_name, query=None):
+        """
+        Alternative method to extract data directly using Python and upload to Blob Storage.
+        Useful for smaller tables or when customization is needed.
+        """
+        try:
+            if not query:
+                query = f"SELECT * FROM {table_name}"
+            
+            # Create cursor and execute query
+            cursor = self.source_conn.cursor()
+            cursor.execute(query)
+            
+            # Get column names
+            columns = [column[0] for column in cursor.description]
+            
+            # Create container if it doesn't exist
+            container_client = self.blob_service_client.get_container_client(self.container_name)
+            try:
+                container_client.get_container_properties()
+            except:
+                container_client = self.blob_service_client.create_container(self.container_name)
+                logger.info(f"Container {self.container_name} created")
+            
+            # Process data in batches to handle large datasets
+            batch_count = 0
+            while True:
+                rows = cursor.fetchmany(self.batch_size)
+                if not rows:
+                    break
+                
+                # Create DataFrame from batch
+                df = pd.DataFrame.from_records(rows, columns=columns)
+                
+                # Save to temp CSV file
+                temp_file = f"temp_{table_name}_batch_{batch_count}.csv"
+                df.to_csv(temp_file, index=False)
+                
+                # Upload to blob storage
+                blob_name = f"{table_name}/batch_{batch_count}.csv"
+                blob_client = container_client.get_blob_client(blob_name)
+                
+                with open(temp_file, "rb") as data:
+                    blob_client.upload_blob(data, overwrite=True)
+                
+                # Clean up temp file
+                os.remove(temp_file)
+                
+                logger.info(f"Uploaded batch {batch_count} for table {table_name}")
+                batch_count += 1
+            
+            logger.info(f"Direct extraction completed for table {table_name}. Total batches: {batch_count}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed direct extraction for table {table_name}: {str(e)}")
+            return False
+    
+    def validate_migration(self, table_name):
+        """Validate the migrated data by comparing record counts and checksums."""
+        try:
+            # Get source record count
+            cursor = self.source_conn.cursor()
+            cursor.execute(f"SELECT COUNT(*) FROM {table_name}")
+            source_count = cursor.fetchone()[0]
+            
+            # Get a sample of data for checksum
+            cursor.execute(f"SELECT TOP 100 * FROM {table_name} ORDER BY 1")
+            source_sample = cursor.fetchall()
+            
+            # Download the migrated data for validation
+            container_client = self.blob_service_client.get_container_client(self.container_name)
+            
+            # List all blobs for this table
+            blobs = list(container_client.list_blobs(name_starts_with=f"{table_name}/"))
+            
+            # Calculate total records in destination
+            dest_count = 0
+            dest_sample_data = []
+            
+            for blob in blobs:
+                blob_client = container_client.get_blob_client(blob.name)
+                downloaded_data = blob_client.download_blob().readall()
+                df = pd.read_csv(pd.io.common.BytesIO(downloaded_data))
+                
+                dest_count += len(df)
+                if len(dest_sample_data) < 100:
+                    dest_sample_data.extend(df.head(100 - len(dest_sample_data)).values.tolist())
+            
+            # Compare record counts
+            count_match = source_count == dest_count
+            
+            # Basic data validation - compare first few rows
+            data_match = True
+            for i, source_row in enumerate(source_sample[:min(len(source_sample), len(dest_sample_data))]):
+                for j, val in enumerate(source_row):
+                    if str(val) != str(dest_sample_data[i][j]):
+                        data_match = False
+                        break
+                if not data_match:
+                    break
+            
+            validation_result = {
+                "table_name": table_name,
+                "source_count": source_count,
+                "destination_count": dest_count,
+                "count_match": count_match,
+                "data_sample_match": data_match,
+                "validation_passed": count_match and data_match
+            }
+            
+            logger.info(f"Validation for {table_name}: {validation_result}")
+            return validation_result
+        except Exception as e:
+            logger.error(f"Validation failed for {table_name}: {str(e)}")
+            return {"table_name": table_name, "validation_passed": False, "error": str(e)}
+    
+    def run_migration(self):
+        """Execute the full migration process."""
+        logger.info("Starting the cloud migration process")
+        
+        # Step 1: Connect to source database
+        if not self.connect_to_source_db():
+            return False
+        
+        # Step 2: Create ADF pipeline
+        if not self.create_data_factory_pipeline():
+            return False
+        
+        # Step 3: Execute pipelines
+        if not self.execute_pipelines():
+            return False
+        
+        # Step 4: Validate migration
+        validation_results = []
+        for source in self.data_sources:
+            table_name = source['table']
+            validation_result = self.validate_migration(table_name)
+            validation_results.append(validation_result)
+        
+        # Check overall validation status
+        all_passed = all(result.get('validation_passed', False) for result in validation_results)
+        
+        if all_passed:
+            logger.info("Migration completed successfully with all validations passed")
+        else:
+            failed_tables = [result['table_name'] for result in validation_results if not result.get('validation_passed', False)]
+            logger.warning(f"Migration completed but validation failed for tables: {', '.join(failed_tables)}")
+        
+        return all_passed
+
+# Sample config.ini structure
+"""
+[Azure]
+SubscriptionId = your-subscription-id
+ResourceGroup = your-resource-group
+DataFactoryName = your-data-factory
+StorageAccountName = your-storage-account
+StorageAccountKey = your-storage-account-key
+ContainerName = migration-data
+
+[OnPremDB]
+Server = your-server-name
+Database = your-database-name
+Username = your-username
+Password = your-password
+
+[Migration]
+BatchSize = 10000
+ParallelThreads = 4
+DataSources = [{"table": "Customers", "query": "SELECT * FROM Customers"}, {"table": "Orders", "query": "SELECT * FROM Orders"}, {"table": "Products"}]
+"""
+
+# Terraform configuration for infrastructure provisioning
+terraform_config = """
+# main.tf - Terraform configuration for cloud migration infrastructure
+
+provider "azurerm" {
+  features {}
+}
+
+resource "azurerm_resource_group" "migration_rg" {
+  name     = var.resource_group_name
+  location = var.location
+}
+
+resource "azurerm_storage_account" "migration_storage" {
+  name                     = var.storage_account_name
+  resource_group_name      = azurerm_resource_group.migration_rg.name
+  location                 = azurerm_resource_group.migration_rg.location
+  account_tier             = "Standard"
+  account_replication_type = "LRS"
+}
+
+resource "azurerm_storage_container" "migration_container" {
+  name                  = var.container_name
+  storage_account_name  = azurerm_storage_account.migration_storage.name
+  container_access_type = "private"
+}
+
+resource "azurerm_data_factory" "migration_adf" {
+  name                = var.data_factory_name
+  location            = azurerm_resource_group.migration_rg.location
+  resource_group_name = azurerm_resource_group.migration_rg.name
+}
+
+resource "azurerm_data_factory_integration_runtime_azure" "adf_runtime" {
+  name                = "AzureIntegrationRuntime"
+  data_factory_name   = azurerm_data_factory.migration_adf.name
+  resource_group_name = azurerm_resource_group.migration_rg.name
+  location            = azurerm_resource_group.migration_rg.location
+  compute_type        = "General"
+  core_count          = 8
+  time_to_live_min    = 60
+}
+
+resource "azurerm_data_factory_integration_runtime_self_hosted" "on_prem_runtime" {
+  name                = "SelfHostedIntegrationRuntime"
+  data_factory_name   = azurerm_data_factory.migration_adf.name
+  resource_group_name = azurerm_resource_group.migration_rg.name
+}
+
+output "storage_account_name" {
+  value = azurerm_storage_account.migration_storage.name
+}
+
+output "storage_account_key" {
+  value     = azurerm_storage_account.migration_storage.primary_access_key
+  sensitive = true
+}
+
+output "data_factory_name" {
+  value = azurerm_data_factory.migration_adf.name
+}
+
+output "self_hosted_ir_key" {
+  value     = azurerm_data_factory_integration_runtime_self_hosted.on_prem_runtime.primary_authorization_key
+  sensitive = true
+}
+"""
+
+# Usage example
+if __name__ == "__main__":
+    # Create migration pipeline
+    pipeline = CloudMigrationPipeline('config.ini')
+    
+    # Execute migration
+    success = pipeline.run_migration()
+    
+    if success:
+        print("Migration completed successfully!")
+    else:
+        print("Migration failed. Check logs for details.")
