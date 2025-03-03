@@ -1,0 +1,63 @@
+# Cloud Migration Pipeline Configuration
+# Copy this file to config.ini and update with your settings
+
+[Azure]
+# Azure subscription and resource information
+SubscriptionId = your-subscription-id
+ResourceGroup = your-resource-group
+DataFactoryName = your-data-factory
+StorageAccountName = your-storage-account
+StorageAccountKey = your-storage-account-key
+ContainerName = migration-data
+
+[OnPremDB]
+# On-premises database connection information
+Server = your-server-name
+Database = your-database-name
+Username = your-username
+Password = your-password
+# Optional: Connection timeout in seconds
+Timeout = 30
+# Optional: Enable encrypted connection
+Encrypt = true
+
+[Migration]
+# Migration configuration and performance settings
+BatchSize = 10000
+ParallelThreads = 4
+# JSON array of data sources (tables) to migrate
+# Each entry can specify a table name and optionally a custom query
+DataSources = [
+  {"table": "Customers", "query": "SELECT * FROM Customers WHERE LastModified > '2023-01-01'"},
+  {"table": "Orders", "query": "SELECT * FROM Orders WHERE Status = 'Completed'"},
+  {"table": "Products"},
+  {"table": "Suppliers"}
+]
+# Optional: Maximum retry attempts for failed operations
+MaxRetries = 3
+# Optional: Enable incremental loading (requires timestamp column)
+IncrementalLoad = false
+# Optional: Timestamp column for incremental loading
+TimestampColumn = LastModified
+
+[Logging]
+# Logging configuration
+LogLevel = INFO
+# Optional: Log file path (default: ./logs/migration.log)
+LogFile = ./logs/migration.log
+# Optional: Enable console logging
+ConsoleLog = true
+# Optional: Log rotation settings
+MaxLogSize = 10485760
+LogBackupCount = 5
+
+[Validation]
+# Data validation settings
+# Enable/disable data validation
+EnableValidation = true
+# Validation method: count, checksum, sample
+ValidationMethod = count
+# Sample size for sample validation method
+SampleSize = 100
+# Tolerance percentage for numeric comparisons
+Tolerance = 0.01
